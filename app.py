@@ -90,46 +90,80 @@ def parse_results_json(raw: str) -> List[DocPred]:
 
     return docs
 
-def parse_results_csv(file_bytes: bytes) -> List[DocPred]:
-    """
-    Expects a CSV with at least: doc_id, field, value
-    Optional: confidence
-    Example rows:
-      brief_001.pdf,Briefdatum,03.03.2025,0.91
-    """
+def parse_results_csv(file_bytes: bytes, id_column: str | None = None) -> list[DocPred]:
     df = pd.read_csv(io.BytesIO(file_bytes))
-    # flexible column names
-    cols = {c.lower().strip(): c for c in df.columns}
-    def col(*names):
-        for n in names:
-            if n in cols:
-                return cols[n]
-        return None
 
-    c_doc = col("doc_id", "document_id", "filename", "file")
-    c_field = col("field", "key", "name")
-    c_value = col("value", "pred_value", "prediction")
-    c_conf = col("confidence", "score", "prob")
+    # Normalize column lookup
+    cols_norm = {c.lower().strip(): c for c in df.columns}
 
-    if not c_doc or not c_field or not c_value:
-        raise ValueError("CSV braucht Spalten doc_id/document_id/filename, field, value (confidence optional).")
+    def has_col(*names: str) -> bool:
+        return any(n in cols_norm for n in names)
 
-    docs_map: Dict[str, Dict[str, FieldPred]] = {}
+    # ---- Case A: "long format" (one row per field)
+    # Required: doc_id + field + value (names flexible)
+    if has_col("field", "key", "name") and has_col("value", "pred_value", "prediction"):
+        # choose doc column
+        doc_candidates = ["doc_id", "document_id", "filename", "file", "id", "sp_num", "spnummer", "sp", "itemid"]
+        c_doc = None
+        for cand in doc_candidates:
+            if cand in cols_norm:
+                c_doc = cols_norm[cand]
+                break
+        if c_doc is None and id_column is not None and id_column in df.columns:
+            c_doc = id_column
+        if c_doc is None:
+            raise ValueError("Long-CSV erkannt, aber keine Dokument-ID Spalte gefunden. Bitte id_column angeben.")
+
+        # choose field/value/conf columns
+        c_field = cols_norm.get("field") or cols_norm.get("key") or cols_norm.get("name")
+        c_value = cols_norm.get("value") or cols_norm.get("pred_value") or cols_norm.get("prediction")
+        c_conf = cols_norm.get("confidence") or cols_norm.get("score") or cols_norm.get("prob")
+
+        docs_map: dict[str, dict[str, FieldPred]] = {}
+        for _, row in df.iterrows():
+            doc_id = safe_str(row[c_doc])
+            field = safe_str(row[c_field])
+            value = safe_str(row[c_value])
+            if not doc_id or not field:
+                continue
+            conf = None
+            if c_conf and pd.notna(row[c_conf]):
+                try:
+                    conf = float(row[c_conf])
+                except Exception:
+                    conf = None
+            docs_map.setdefault(doc_id, {})[field] = FieldPred(value=value, confidence=conf)
+
+        return [DocPred(doc_id=k, fields=v) for k, v in docs_map.items()]
+
+    # ---- Case B: "wide format" (one row per document, columns are fields)
+    # Determine id column
+    if id_column is None:
+        # Heuristik: wenn es eine typische ID-Spalte gibt, nimm die; sonst nimm die erste Spalte
+        typical = ["sp_num", "spnummer", "itemid", "id", "doc_id", "document_id", "filename", "file"]
+        for t in typical:
+            if t in cols_norm:
+                id_column = cols_norm[t]
+                break
+        if id_column is None:
+            id_column = df.columns[0]  # fallback
+
+    if id_column not in df.columns:
+        raise ValueError(f"id_column '{id_column}' existiert nicht in der CSV.")
+
+    field_cols = [c for c in df.columns if c != id_column]
+
+    preds: list[DocPred] = []
     for _, row in df.iterrows():
-        doc_id = safe_str(row[c_doc])
-        field = safe_str(row[c_field])
-        value = safe_str(row[c_value])
-        if not doc_id or not field:
+        doc_id = safe_str(row[id_column])
+        if not doc_id:
             continue
-        conf = None
-        if c_conf and pd.notna(row[c_conf]):
-            try:
-                conf = float(row[c_conf])
-            except Exception:
-                conf = None
-        docs_map.setdefault(doc_id, {})[field] = FieldPred(value=value, confidence=conf)
+        fields: dict[str, FieldPred] = {}
+        for c in field_cols:
+            fields[str(c)] = FieldPred(value=safe_str(row[c]), confidence=None)
+        preds.append(DocPred(doc_id=str(doc_id), fields=fields))
 
-    return [DocPred(doc_id=k, fields=v) for k, v in docs_map.items()]
+    return preds
 
 def build_match_index(pdf_files: List[Tuple[str, bytes]], preds: List[DocPred]) -> Tuple[List[str], Dict[str, bytes], Dict[str, DocPred], List[str]]:
     """
@@ -291,14 +325,28 @@ if st.session_state.stage == "upload":
     with col2:
         st.subheader("Upload AI Results")
         res_file = st.file_uploader("JSON oder CSV auswählen", type=["json", "csv"])
+
         if res_file:
             try:
                 if res_file.name.lower().endswith(".json"):
-                    raw = res_file.read().decode("utf-8")
+                    raw = res_file.getvalue().decode("utf-8")
                     st.session_state.preds = parse_results_json(raw)
+
                 else:
-                    st.session_state.preds = parse_results_csv(res_file.read())
+                    csv_bytes = res_file.getvalue()
+                    df_preview = pd.read_csv(io.BytesIO(csv_bytes))
+
+                    st.write("CSV Columns:", list(df_preview.columns))
+
+                    id_col_choice = st.selectbox(
+                        "Welche Spalte ist die Dokument-ID? (Dateiname-Spalte auswählen)",
+                        df_preview.columns
+                    )
+
+                    st.session_state.preds = parse_results_csv(csv_bytes, id_column=id_col_choice)
+
                 st.success(f"{len(st.session_state.preds)} Dokument-Result(s) geladen.")
+
             except Exception as e:
                 st.error(f"Konnte Results nicht lesen: {e}")
 
