@@ -90,19 +90,20 @@ def parse_results_json(raw: str) -> List[DocPred]:
 
     return docs
 
-def parse_results_csv(file_bytes: bytes, id_column: str | None = None) -> list[DocPred]:
+def parse_results_csv(file_bytes: bytes, id_column: str | None = None) -> List[DocPred]:
+    """
+    Supports:
+      A) Long format: columns like [doc_id, field, value, confidence?]
+      B) Wide format: one row per document, columns are fields, one ID column (chosen)
+    """
     df = pd.read_csv(io.BytesIO(file_bytes))
-
-    # Normalize column lookup
     cols_norm = {c.lower().strip(): c for c in df.columns}
 
     def has_col(*names: str) -> bool:
         return any(n in cols_norm for n in names)
 
-    # ---- Case A: "long format" (one row per field)
-    # Required: doc_id + field + value (names flexible)
+    # ---- A) Long format
     if has_col("field", "key", "name") and has_col("value", "pred_value", "prediction"):
-        # choose doc column
         doc_candidates = ["doc_id", "document_id", "filename", "file", "id", "sp_num", "spnummer", "sp", "itemid"]
         c_doc = None
         for cand in doc_candidates:
@@ -112,14 +113,13 @@ def parse_results_csv(file_bytes: bytes, id_column: str | None = None) -> list[D
         if c_doc is None and id_column is not None and id_column in df.columns:
             c_doc = id_column
         if c_doc is None:
-            raise ValueError("Long-CSV erkannt, aber keine Dokument-ID Spalte gefunden. Bitte id_column angeben.")
+            raise ValueError("Long-CSV erkannt, aber keine Dokument-ID Spalte gefunden. Bitte ID-Spalte auswählen.")
 
-        # choose field/value/conf columns
         c_field = cols_norm.get("field") or cols_norm.get("key") or cols_norm.get("name")
         c_value = cols_norm.get("value") or cols_norm.get("pred_value") or cols_norm.get("prediction")
         c_conf = cols_norm.get("confidence") or cols_norm.get("score") or cols_norm.get("prob")
 
-        docs_map: dict[str, dict[str, FieldPred]] = {}
+        docs_map: Dict[str, Dict[str, FieldPred]] = {}
         for _, row in df.iterrows():
             doc_id = safe_str(row[c_doc])
             field = safe_str(row[c_field])
@@ -136,29 +136,27 @@ def parse_results_csv(file_bytes: bytes, id_column: str | None = None) -> list[D
 
         return [DocPred(doc_id=k, fields=v) for k, v in docs_map.items()]
 
-    # ---- Case B: "wide format" (one row per document, columns are fields)
-    # Determine id column
+    # ---- B) Wide format
     if id_column is None:
-        # Heuristik: wenn es eine typische ID-Spalte gibt, nimm die; sonst nimm die erste Spalte
         typical = ["sp_num", "spnummer", "itemid", "id", "doc_id", "document_id", "filename", "file"]
         for t in typical:
             if t in cols_norm:
                 id_column = cols_norm[t]
                 break
         if id_column is None:
-            id_column = df.columns[0]  # fallback
+            id_column = df.columns[0]
 
     if id_column not in df.columns:
-        raise ValueError(f"id_column '{id_column}' existiert nicht in der CSV.")
+        raise ValueError(f"ID-Spalte '{id_column}' existiert nicht in der CSV.")
 
     field_cols = [c for c in df.columns if c != id_column]
 
-    preds: list[DocPred] = []
+    preds: List[DocPred] = []
     for _, row in df.iterrows():
         doc_id = safe_str(row[id_column])
         if not doc_id:
             continue
-        fields: dict[str, FieldPred] = {}
+        fields: Dict[str, FieldPred] = {}
         for c in field_cols:
             fields[str(c)] = FieldPred(value=safe_str(row[c]), confidence=None)
         preds.append(DocPred(doc_id=str(doc_id), fields=fields))
@@ -166,16 +164,8 @@ def parse_results_csv(file_bytes: bytes, id_column: str | None = None) -> list[D
     return preds
 
 def build_match_index(pdf_files: List[Tuple[str, bytes]], preds: List[DocPred]) -> Tuple[List[str], Dict[str, bytes], Dict[str, DocPred], List[str]]:
-    """
-    Returns:
-      ordered_doc_ids (based on PDFs), pdf_map (doc_id -> bytes), pred_map (doc_id -> DocPred), unmatched_pdf_ids
-    Matching strategy:
-      - exact match on normalized doc_id (including .pdf)
-      - if not found: try match by basename without extension
-    """
     pred_by_norm: Dict[str, DocPred] = {normalize_doc_id(p.doc_id): p for p in preds}
 
-    # also index by basename
     pred_by_base: Dict[str, DocPred] = {}
     for p in preds:
         base = normalize_doc_id(re.sub(r"\.pdf$", "", p.doc_id.strip(), flags=re.I))
@@ -196,30 +186,13 @@ def build_match_index(pdf_files: List[Tuple[str, bytes]], preds: List[DocPred]) 
 
         p = pred_by_norm.get(norm) or pred_by_base.get(base)
         if p:
-            pred_map[doc_id] = p  # key by PDF filename, so UI stays consistent
+            pred_map[doc_id] = p
         else:
             unmatched.append(doc_id)
 
     return ordered_ids, pdf_map, pred_map, unmatched
 
-def pdf_viewer(pdf_bytes: bytes):
-    st.download_button(
-        label="📄 Open PDF in new tab",
-        data=pdf_bytes,
-        file_name="document.pdf",
-        mime="application/pdf",
-        use_container_width=True
-    )
-
-    st.write("Preview:")
-    st.markdown(
-        f'<embed src="data:application/pdf;base64,{base64.b64encode(pdf_bytes).decode()}" '
-        f'width="100%" height="700" type="application/pdf">',
-        unsafe_allow_html=True
-    )
-
 def now_iso_berlin() -> str:
-    # simple ISO timestamp (local tz not essential for MVP)
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
 
@@ -228,23 +201,13 @@ def now_iso_berlin() -> str:
 # ----------------------------
 
 def compute_metrics(validations: List[dict]) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, float]]:
-    """
-    validations rows:
-      {doc_id, field, pred_value, confidence, verdict, true_value}
-    verdict in {"correct","incorrect","missing","skip"}
-    """
     df = pd.DataFrame(validations)
     if df.empty:
         return pd.DataFrame(), pd.DataFrame(), {"overall_accuracy_on_predicted": 0.0}
 
-    # Field-level counts
-    def is_tp(v): return v == "correct"
-    def is_fp(v): return v == "incorrect"
-    def is_fn(v): return v == "missing"
-
-    df["TP"] = df["verdict"].apply(lambda v: 1 if is_tp(v) else 0)
-    df["FP"] = df["verdict"].apply(lambda v: 1 if is_fp(v) else 0)
-    df["FN"] = df["verdict"].apply(lambda v: 1 if is_fn(v) else 0)
+    df["TP"] = (df["verdict"] == "correct").astype(int)
+    df["FP"] = (df["verdict"] == "incorrect").astype(int)
+    df["FN"] = (df["verdict"] == "missing").astype(int)
 
     field_grp = df.groupby("field", dropna=False)[["TP", "FP", "FN"]].sum().reset_index()
     field_grp["precision"] = field_grp.apply(lambda r: r["TP"] / (r["TP"] + r["FP"]) if (r["TP"] + r["FP"]) > 0 else None, axis=1)
@@ -256,12 +219,10 @@ def compute_metrics(validations: List[dict]) -> Tuple[pd.DataFrame, pd.DataFrame
         axis=1
     )
 
-    # Document-level: how many correct/incorrect/missing per doc
     doc_grp = df.groupby("doc_id")[["TP", "FP", "FN"]].sum().reset_index()
     doc_grp["total_judged"] = doc_grp["TP"] + doc_grp["FP"] + doc_grp["FN"]
     doc_grp["doc_accuracy"] = doc_grp.apply(lambda r: r["TP"] / r["total_judged"] if r["total_judged"] > 0 else None, axis=1)
 
-    # Overall accuracy (only on predicted fields i.e. correct vs incorrect)
     judged_pred = df[df["verdict"].isin(["correct", "incorrect"])]
     overall_acc = (judged_pred["verdict"] == "correct").mean() if len(judged_pred) else 0.0
 
@@ -280,20 +241,14 @@ st.title("Test AI Results")
 if "stage" not in st.session_state:
     st.session_state.stage = "upload"
 
-if "pdf_files" not in st.session_state:
-    st.session_state.pdf_files = []  # List[(filename, bytes)]
-if "preds" not in st.session_state:
-    st.session_state.preds = []       # List[DocPred]
-if "ordered_ids" not in st.session_state:
-    st.session_state.ordered_ids = []
-if "pdf_map" not in st.session_state:
-    st.session_state.pdf_map = {}
-if "pred_map" not in st.session_state:
-    st.session_state.pred_map = {}
-if "idx" not in st.session_state:
-    st.session_state.idx = 0
-if "validations" not in st.session_state:
-    st.session_state.validations = []  # list of dict rows
+st.session_state.setdefault("pdf_files", [])      # List[(filename, bytes)]
+st.session_state.setdefault("preds", [])          # List[DocPred]
+st.session_state.setdefault("ordered_ids", [])
+st.session_state.setdefault("pdf_map", {})
+st.session_state.setdefault("pred_map", {})
+st.session_state.setdefault("idx", 0)
+st.session_state.setdefault("validations", [])
+st.session_state.setdefault("doc_notes", {})
 if "run_meta" not in st.session_state:
     st.session_state.run_meta = {
         "run_name": f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
@@ -372,7 +327,7 @@ if st.session_state.stage == "upload":
         st.info("Bitte zuerst PDFs und AI Results hochladen.")
 
 # ----------------------------
-# Stage 2: Quiz / Validation
+# Stage 2: Quiz / Validation (Focus Mode + Field Progress)
 # ----------------------------
 elif st.session_state.stage == "quiz":
     ordered = st.session_state.ordered_ids
@@ -410,18 +365,15 @@ elif st.session_state.stage == "quiz":
             st_pdf_viewer(pdf_bytes, height=720)
 
         with right:
-            st.caption("Felder (✅ korrekt / ❌ falsch / ✏️ korrigieren / ∅ missing / ⏭ skip)")
+            st.caption("Felder (Focus Mode: immer das nächste unbewertete Feld oben)")
             if pred is None:
-                st.warning("Kein Result für dieses PDF gematched. Du kannst skippen oder zurück zum Upload.")
-                if st.button("⏭ Skip this doc"):
+                st.warning("Kein Result für dieses PDF gematched.")
+                if st.button("⏭ Skip this doc", use_container_width=True):
                     st.session_state.idx = min(len(ordered) - 1, i + 1)
                     st.rerun()
             else:
-                # Key to keep widget state per doc
-                st.session_state.setdefault("doc_notes", {})
+                # Notiz
                 st.session_state.doc_notes.setdefault(doc_id, "")
-
-                # Optional per-doc note
                 st.session_state.doc_notes[doc_id] = st.text_area(
                     "Notiz (optional)",
                     value=st.session_state.doc_notes[doc_id],
@@ -429,99 +381,85 @@ elif st.session_state.stage == "quiz":
                     key=f"note_{doc_id}"
                 )
 
-                fields = list(pred.fields.keys())
-                if not fields:
+                fields_sorted = sorted(pred.fields.keys(), key=lambda x: x.lower())
+
+                if not fields_sorted:
                     st.info("Keine Felder im Result gefunden.")
                 else:
-                    # Show fields sorted
-                    fields_sorted = sorted(fields, key=lambda x: x.lower())
+                    def verdict_of(field_name: str) -> str:
+                        return st.session_state.get(f"verdict_{doc_id}_{field_name}", "skip")
 
-                    # Quick actions
-                    qa = st.columns(3)
-                    if qa[0].button("✅ All Correct", use_container_width=True):
-                        for f in fields_sorted:
-                            st.session_state[f"verdict_{doc_id}_{f}"] = "correct"
-                            st.session_state[f"true_{doc_id}_{f}"] = ""
+                    def is_done(field_name: str) -> bool:
+                        return verdict_of(field_name) != "skip"
+
+                    done_count = sum(1 for f in fields_sorted if is_done(f))
+                    total_fields = len(fields_sorted)
+
+                    # nächstes unbewertetes Feld
+                    current_field = next((f for f in fields_sorted if not is_done(f)), None)
+                    if current_field is None:
+                        current_field = fields_sorted[-1]  # alles bewertet
+
+                    # Field progress: "Field 2 / 5" (1-indexed, zeigt aktuelles Feld)
+                    # Wenn noch unbewertet: current index = done_count + 1, sonst = total_fields
+                    current_pos = done_count + 1 if done_count < total_fields else total_fields
+                    st.markdown(f"### Field {current_pos} / {total_fields}")
+
+                    f = current_field
+                    pred_val = pred.fields[f].value
+                    conf = pred.fields[f].confidence
+
+                    st.markdown(f"## {f}")
+                    st.write(f"Predicted: `{pred_val}`" if pred_val is not None else "Predicted: _(empty)_")
+                    if conf is not None:
+                        st.caption(f"confidence: {conf:.3f}")
+
+                    verdict_key = f"verdict_{doc_id}_{f}"
+                    true_key = f"true_{doc_id}_{f}"
+                    st.session_state.setdefault(verdict_key, "skip")
+                    st.session_state.setdefault(true_key, "")
+
+                    c1, c2, c3 = st.columns(3)
+                    if c1.button("✅ Correct", use_container_width=True):
+                        st.session_state[verdict_key] = "correct"
+                        st.session_state[true_key] = ""
                         st.rerun()
-                    if qa[1].button("⏭ All Skip", use_container_width=True):
-                        for f in fields_sorted:
-                            st.session_state[f"verdict_{doc_id}_{f}"] = "skip"
-                            st.session_state[f"true_{doc_id}_{f}"] = ""
+                    if c2.button("❌ Incorrect", use_container_width=True):
+                        st.session_state[verdict_key] = "incorrect"
                         st.rerun()
-                    if qa[2].button("❌ All Incorrect", use_container_width=True):
-                        for f in fields_sorted:
-                            st.session_state[f"verdict_{doc_id}_{f}"] = "incorrect"
-                            st.rerun()
+                    if c3.button("∅ Missing", use_container_width=True):
+                        st.session_state[verdict_key] = "missing"
+                        st.rerun()
+
+                    if st.session_state[verdict_key] in ["incorrect", "missing"]:
+                        st.text_input(
+                            "True value (optional)",
+                            key=true_key,
+                            placeholder="korrekter Wert"
+                        )
 
                     st.divider()
 
-                    # Per field UI
-                    for f in fields_sorted:
-                        pred_val = pred.fields[f].value
-                        conf = pred.fields[f].confidence
-
-                        st.markdown(f"**{f}**")
-                        st.write(f"Predicted: `{pred_val}`" if pred_val is not None else "Predicted: _(empty)_")
-                        if conf is not None:
-                            st.caption(f"confidence: {conf:.3f}")
-
-                        verdict_key = f"verdict_{doc_id}_{f}"
-                        true_key = f"true_{doc_id}_{f}"
-
-                        if verdict_key not in st.session_state:
-                            st.session_state[verdict_key] = "skip"
-                        if true_key not in st.session_state:
-                            st.session_state[true_key] = ""
-
-                        vcols = st.columns([1, 1, 1, 1, 2])
-                        if vcols[0].button("✅", key=f"btn_ok_{doc_id}_{f}"):
-                            st.session_state[verdict_key] = "correct"
-                        if vcols[1].button("❌", key=f"btn_no_{doc_id}_{f}"):
-                            st.session_state[verdict_key] = "incorrect"
-                        if vcols[2].button("✏️", key=f"btn_edit_{doc_id}_{f}"):
-                            st.session_state[verdict_key] = "incorrect"
-                        if vcols[3].button("∅", key=f"btn_missing_{doc_id}_{f}"):
-                            st.session_state[verdict_key] = "missing"
-
-                        st.selectbox(
-                            "Status",
-                            ["correct", "incorrect", "missing", "skip"],
-                            index=["correct", "incorrect", "missing", "skip"].index(st.session_state[verdict_key]),
-                            key=verdict_key,
-                            label_visibility="collapsed"
-                        )
-
-                        if st.session_state[verdict_key] in ["incorrect", "missing"]:
-                            st.text_input(
-                                "True value (optional bei missing/incorrect)",
-                                key=true_key,
-                                label_visibility="collapsed",
-                                placeholder="korrekter Wert (wenn du ihn kennst)"
-                            )
-
-                        st.divider()
-
-                    # Save doc validations
+                    # Save (speichert ALLE Felder dieses Dokuments; skip bleibt skip)
                     if st.button("💾 Save this document", type="primary", use_container_width=True):
-                        # Remove existing validations for this doc to allow re-save
-                        st.session_state.validations = [r for r in st.session_state.validations if r["doc_id"] != doc_id]
+                        st.session_state.validations = [
+                            r for r in st.session_state.validations if r["doc_id"] != doc_id
+                        ]
 
-                        for f in fields_sorted:
-                            pred_val = pred.fields[f].value
-                            conf = pred.fields[f].confidence
-                            verdict = st.session_state.get(f"verdict_{doc_id}_{f}", "skip")
-                            true_val = st.session_state.get(f"true_{doc_id}_{f}", "")
-
+                        for ff in fields_sorted:
+                            pv = pred.fields[ff].value
+                            cc = pred.fields[ff].confidence
+                            vv = st.session_state.get(f"verdict_{doc_id}_{ff}", "skip")
+                            tv = st.session_state.get(f"true_{doc_id}_{ff}", "")
                             st.session_state.validations.append({
                                 "doc_id": doc_id,
-                                "field": f,
-                                "pred_value": pred_val,
-                                "confidence": conf,
-                                "verdict": verdict,
-                                "true_value": true_val if true_val.strip() != "" else None
+                                "field": ff,
+                                "pred_value": pv,
+                                "confidence": cc,
+                                "verdict": vv,
+                                "true_value": tv.strip() or None
                             })
 
-                        # Auto-advance
                         st.session_state.idx = min(len(ordered) - 1, i + 1)
                         st.success("Gespeichert.")
                         st.rerun()
