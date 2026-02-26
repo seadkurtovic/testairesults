@@ -316,11 +316,10 @@ if st.session_state.stage == "upload":
                     valid_selected = all_fields
                 st.session_state.selected_fields = valid_selected
 
-            st.multiselect(
+            st.session_state.selected_fields = st.multiselect(
                 "Welche Felder möchtest du testen?",
                 options=all_fields,
                 default=st.session_state.selected_fields,
-                key="selected_fields"
             )
             st.caption("Hinweis: Nur diese Felder werden im Quiz angezeigt und in Export/Metriken berücksichtigt.")
 
