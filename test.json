@@ -1,0 +1,20 @@
+{
+  "documents": [
+    {
+      "doc_id": "brief_001.pdf",
+      "fields": {
+        "Briefdatum": "03.03.2025",
+        "Brieftitel": "Anhörung zur Stellungnahme",
+        "Briefsender": "Stadtverwaltung München"
+      }
+    },
+    {
+      "doc_id": "brief_002.pdf",
+      "fields": {
+        "Briefdatum": "15.01.2025",
+        "Brieftitel": "Bescheid über Gewerbesteuer",
+        "Briefsender": "Finanzamt München"
+      }
+    }
+  ]
+}
