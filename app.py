@@ -305,6 +305,25 @@ if st.session_state.stage == "upload":
             except Exception as e:
                 st.error(f"Konnte Results nicht lesen: {e}")
 
+        if st.session_state.preds:
+            all_fields = sorted({k for d in st.session_state.preds for k in d.fields.keys()}, key=str.lower)
+
+            if "selected_fields" not in st.session_state:
+                st.session_state.selected_fields = all_fields
+            else:
+                valid_selected = [f for f in st.session_state.selected_fields if f in all_fields]
+                if st.session_state.selected_fields and not valid_selected and all_fields:
+                    valid_selected = all_fields
+                st.session_state.selected_fields = valid_selected
+
+            st.multiselect(
+                "Welche Felder möchtest du testen?",
+                options=all_fields,
+                default=st.session_state.selected_fields,
+                key="selected_fields"
+            )
+            st.caption("Hinweis: Nur diese Felder werden im Quiz angezeigt und in Export/Metriken berücksichtigt.")
+
     st.divider()
 
     if st.session_state.pdf_files and st.session_state.preds:
@@ -318,7 +337,11 @@ if st.session_state.stage == "upload":
             with st.expander("Unmatched PDFs anzeigen"):
                 st.write(unmatched)
 
-        if st.button("Start Validation ▶️", type="primary", use_container_width=True):
+        selected_fields = st.session_state.get("selected_fields", [])
+        if not selected_fields:
+            st.warning("Bitte mindestens ein Feld unter 'Welche Felder möchtest du testen?' auswählen.")
+
+        if st.button("Start Validation ▶️", type="primary", use_container_width=True, disabled=(not selected_fields)):
             st.session_state.idx = 0
             st.session_state.validations = []
             st.session_state.stage = "quiz"
@@ -332,8 +355,14 @@ if st.session_state.stage == "upload":
 elif st.session_state.stage == "quiz":
     ordered = st.session_state.ordered_ids
     i = st.session_state.idx
+    selected_fields = st.session_state.get("selected_fields", [])
 
-    if not ordered:
+    if not selected_fields:
+        st.warning("Keine Felder ausgewählt. Gehe zurück zum Upload und wähle Felder aus.")
+        if st.button("⬅️ Zurück zum Upload", use_container_width=True):
+            st.session_state.stage = "upload"
+            st.rerun()
+    elif not ordered:
         st.error("Keine PDFs gefunden. Geh zurück zum Upload.")
         if st.button("⬅️ Zurück"):
             st.session_state.stage = "upload"
@@ -381,10 +410,14 @@ elif st.session_state.stage == "quiz":
                     key=f"note_{doc_id}"
                 )
 
-                fields_sorted = sorted(pred.fields.keys(), key=lambda x: x.lower())
+                selected = set(selected_fields)
+                fields_sorted = sorted([f for f in pred.fields.keys() if f in selected], key=str.lower)
 
                 if not fields_sorted:
-                    st.info("Keine Felder im Result gefunden.")
+                    st.info("Für dieses Dokument gibt es keine ausgewählten Felder.")
+                    if st.button("⏭ Skip this doc", use_container_width=True, key=f"skip_selected_{doc_id}"):
+                        st.session_state.idx = min(len(ordered) - 1, i + 1)
+                        st.rerun()
                 else:
                     def verdict_of(field_name: str) -> str:
                         return st.session_state.get(f"verdict_{doc_id}_{field_name}", "skip")
